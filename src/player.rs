@@ -237,9 +237,22 @@ impl YtMusic {
         signed(chosen, &solver, &token).await
     }
 
-    /// Whether the stream host will serve this url, asked with the smallest range there is.
+    /// Whether the stream host will serve this url: its first byte, and one byte past the first
+    /// [`LATER_BYTE`], asked side by side so the check costs one round trip. Some urls are served
+    /// for their start and refused after it (an iOS url without a proof-of-origin token stops
+    /// after its first megabyte), and a track that commits to one dies partway through.
     async fn serves(&self, format: &AudioFormat) -> bool {
-        match range(&self.http, &format.url, format.user_agent, 0, 0).await {
+        let later = format.content_length.map_or(0, |n| n.saturating_sub(1).min(LATER_BYTE));
+        let (first, deep) = tokio::join!(
+            range(&self.http, &format.url, format.user_agent, 0, 0),
+            async {
+                match later {
+                    0 => Ok(Vec::new()), // length unknown: the start is all we can check
+                    at => range(&self.http, &format.url, format.user_agent, at, at).await,
+                }
+            },
+        );
+        match first.and(deep) {
             Ok(_) => true,
             Err(error) => {
                 log::debug!(
@@ -499,6 +512,10 @@ impl YtMusic {
         Ok(data)
     }
 }
+
+/// Where [`YtMusic::serves`] checks a url a second time: past the first megabyte, where a url
+/// missing its proof-of-origin token is refused.
+const LATER_BYTE: u64 = 1_200_000;
 
 async fn range(
     http: &reqwest::Client,
